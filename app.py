@@ -563,18 +563,51 @@ def get_news():
 
 # ---------------- economic calendar ----------------
 
+# Fed's published 2026 FOMC schedule (decision day of each two-day meeting)
+FOMC_2026 = ["2026-01-28", "2026-03-18", "2026-04-29", "2026-06-17",
+             "2026-07-29", "2026-09-16", "2026-10-28", "2026-12-09"]
+
+
+def synthetic_events():
+    """Major U.S. fixtures projected over the next 14 days.
+
+    The ForexFactory mirror only publishes the current calendar week, so late in
+    the week it says nothing about next week. FOMC dates are published years
+    ahead and the jobs report is the first Friday of the month - project those.
+    """
+    ny = ZoneInfo("America/New_York")
+    now = datetime.now(timezone.utc)
+    horizon = now + timedelta(days=14)
+    out = []
+    for d in FOMC_2026:
+        dt = datetime.fromisoformat(d + "T14:00:00").replace(tzinfo=ny)
+        if now <= dt <= horizon:
+            out.append({"title": "FOMC rate decision & press conference", "country": "USD",
+                        "impact": "High", "dt": dt, "forecast": "", "previous": ""})
+    for base in (now, now + timedelta(days=31)):
+        first = base.astimezone(ny).replace(day=1, hour=8, minute=30, second=0, microsecond=0)
+        nfp = first + timedelta(days=(4 - first.weekday()) % 7)
+        if now <= nfp <= horizon:
+            out.append({"title": "Non-farm payrolls (US jobs report)", "country": "USD",
+                        "impact": "High", "dt": nfp, "forecast": "", "previous": ""})
+    return out
+
+
 def get_calendar():
-    if time.time() - CAL_CACHE["t"] < 6 * 3600 and CAL_CACHE["events"]:
+    # the FF mirror rate-limits hard (429): one fetch per 6h on success, 15 min backoff on failure
+    ttl = 900 if CAL_CACHE.get("err") else 6 * 3600
+    if CAL_CACHE["t"] and time.time() - CAL_CACHE["t"] < ttl:
         return CAL_CACHE["events"]
     events = []
-    for url in ("https://nfs.faireconomy.media/ff_calendar_thisweek.json",
-                "https://nfs.faireconomy.media/ff_calendar_nextweek.json"):
-        try:
-            r = requests.get(url, headers={"User-Agent": UA}, timeout=20)
-            r.raise_for_status()
-            events += r.json()
-        except Exception as e:
-            log(f"  calendar fetch failed: {e}")
+    try:
+        r = requests.get("https://nfs.faireconomy.media/ff_calendar_thisweek.json",
+                         headers={"User-Agent": UA}, timeout=20)
+        r.raise_for_status()
+        events = r.json()
+        CAL_CACHE["err"] = None
+    except Exception as e:
+        CAL_CACHE["err"] = str(e)
+        log(f"  calendar fetch failed: {e}")
     now = datetime.now(timezone.utc) - timedelta(hours=2)
     out = []
     for e in events:
@@ -591,6 +624,14 @@ def get_calendar():
             continue
         out.append({"title": e.get("title", ""), "country": country, "impact": impact,
                     "dt": dt, "forecast": e.get("forecast", ""), "previous": e.get("previous", "")})
+    # merge projected majors the weekly feed can't see yet, skipping ones it already lists
+    for syn in synthetic_events():
+        markers = ("fomc", "federal funds") if "FOMC" in syn["title"] else ("non-farm", "nonfarm")
+        covered = any(any(m in e["title"].lower() for m in markers)
+                      and abs((e["dt"] - syn["dt"]).total_seconds()) < 36 * 3600
+                      for e in out)
+        if not covered:
+            out.append(syn)
     out.sort(key=lambda x: x["dt"])
     CAL_CACHE["t"] = time.time()
     CAL_CACHE["events"] = out[:30]
@@ -894,7 +935,7 @@ tr:last-child td { border-bottom:none; }
   @@NEWS@@
 
   <h2>Market calendar &mdash; next two weeks</h2>
-  <p class="sub">High-impact releases for all major economies plus medium-impact U.S. events (ForexFactory feed). Times shown in both New York and Singapore.</p>
+  <p class="sub">High-impact releases for all major economies plus medium-impact U.S. events. Detailed forecasts cover the current calendar week (ForexFactory, rolls over each weekend); FOMC decisions and jobs reports are projected for the days beyond. Times shown in both New York and Singapore.</p>
   @@CAL@@
 
   <p class="foot">Data scraped from finviz.com screeners; option volume from CBOE delayed quotes; SGX and historical data from Yahoo Finance; charts by TradingView. 15-min and 1-hour surges are computed from successive volume snapshots while the server runs. Not investment advice &mdash; verify implied volatility and earnings dates before selling premium.</p>
@@ -1206,7 +1247,12 @@ def quotes():
 def healthz():
     with _lock:
         built = STATE["built_at"]
-    return {"ok": True, "built_at": built.isoformat() if built else None}
+        n_tickers = len(STATE["tickers"])
+    return {"ok": True, "built_at": built.isoformat() if built else None,
+            "tickers": n_tickers,
+            "news": len(NEWS_CACHE["items"]),
+            "calendar_events": len(CAL_CACHE["events"]),
+            "calendar_error": CAL_CACHE.get("err")}
 
 
 def _start_background():
