@@ -823,28 +823,33 @@ TEMPLATE = """<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" id="metaTheme" content="#fafaf8">
+<meta name="apple-mobile-web-app-capable" content="yes">
 <title>Stocks - premium &amp; volume dashboard</title>
 <style>
-:root { --bg:#fafaf8; --card:#ffffff; --txt:#1a1a18; --mut:#71706b; --bd:#e4e3de; --up:#0f6e56; --dn:#a32d2d; --acc:#ef9f27; --teal:#1d9e75; }
-@media (prefers-color-scheme: dark) {
-  :root { --bg:#1c1c1a; --card:#262624; --txt:#ececea; --mut:#a3a29c; --bd:#3a3936; --up:#5dcaa5; --dn:#f09595; }
-}
+:root { --bg:#fafaf8; --card:#ffffff; --txt:#1a1a18; --mut:#71706b; --bd:#e4e3de; --up:#0f6e56; --dn:#a32d2d; --acc:#ef9f27; --teal:#1d9e75; --link:#185fa5; }
+:root.dark { --bg:#17171a; --card:#222226; --txt:#ececea; --mut:#a3a29c; --bd:#38383d; --up:#5dcaa5; --dn:#f09595; --link:#85b7eb; }
 * { box-sizing:border-box; }
-body { margin:0; padding:24px; background:var(--bg); color:var(--txt); font:14px/1.5 "Segoe UI",system-ui,sans-serif; }
+html { -webkit-text-size-adjust:100%; }
+body { margin:0; padding:24px; background:var(--bg); color:var(--txt); font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",sans-serif; transition:background .25s ease,color .25s ease; }
 .wrap { max-width:860px; margin:0 auto; }
+.topbar { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; }
+#themeBtn { flex:none; border:1px solid var(--bd); background:var(--card); color:var(--txt); border-radius:99px; width:40px; height:40px; font-size:18px; line-height:1; cursor:pointer; transition:transform .15s; }
+#themeBtn:active { transform:scale(.92); }
 h1 { font-size:20px; font-weight:600; margin:0 0 2px; }
 h2 { font-size:16px; font-weight:600; margin:28px 0 4px; }
 .sub { color:var(--mut); font-size:12px; margin:0 0 14px; }
 .badge { display:inline-block; padding:2px 10px; border-radius:99px; font-size:12px; font-weight:600; }
 .badge.open { background:#e1f5ee; color:#085041; }
 .badge.closed { background:#fceaea; color:#791f1f; }
+.twrap { overflow-x:auto; -webkit-overflow-scrolling:touch; border-radius:10px; }
 table { width:100%; border-collapse:collapse; background:var(--card); border:1px solid var(--bd); border-radius:10px; overflow:hidden; font-size:13px; }
-th { text-align:left; font-size:11px; text-transform:uppercase; letter-spacing:.04em; color:var(--mut); padding:8px 10px; border-bottom:1px solid var(--bd); }
+th { text-align:left; font-size:11px; text-transform:uppercase; letter-spacing:.04em; color:var(--mut); padding:8px 10px; border-bottom:1px solid var(--bd); white-space:nowrap; }
 th.num, td.num { text-align:right; }
 td { padding:7px 10px; border-bottom:1px solid var(--bd); }
 tr:last-child td { border-bottom:none; }
-.tick { color:#185fa5; font-weight:600; text-decoration:none; }
-@media (prefers-color-scheme: dark) { .tick { color:#85b7eb; } }
+tbody tr:hover td { background:rgba(125,125,125,.06); }
+.tick { color:var(--link); font-weight:600; text-decoration:none; }
 .up { color:var(--up); } .dn { color:var(--dn); } .flat { color:var(--mut); }
 .mut { color:var(--mut); }
 .barwrap { display:flex; align-items:center; gap:8px; }
@@ -873,11 +878,30 @@ tr:last-child td { border-bottom:none; }
 .chead a { font-size:12px; color:#185fa5; }
 .chead button { margin-left:auto; border:1px solid var(--bd); background:var(--card); color:var(--txt); border-radius:6px; padding:2px 10px; font-size:14px; cursor:pointer; }
 .cbox iframe { flex:1; width:100%; border:0; }
+@media (max-width: 680px) {
+  body { padding:12px; }
+  h1 { font-size:17px; }
+  .tabs button { padding:9px 13px; }
+  .twrap table { min-width:620px; }
+  .news-item { padding:9px 10px; }
+  .cbox { width:100vw; height:92vh; border-radius:12px 12px 0 0; align-self:flex-end; }
+}
 </style>
+<script>
+(function() {
+  var t = null;
+  try { t = localStorage.getItem('findash_theme'); } catch (e) {}
+  if (!t) { t = (window.matchMedia && matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light'; }
+  if (t === 'dark') { document.documentElement.classList.add('dark'); }
+})();
+</script>
 </head>
 <body>
 <div class="wrap">
-  <h1>Stocks &mdash; premium &amp; volume dashboard</h1>
+  <div class="topbar">
+    <h1>Stocks &mdash; premium &amp; volume dashboard</h1>
+    <button id="themeBtn" onclick="toggleTheme()" aria-label="Toggle dark or light mode">&#9790;</button>
+  </div>
   <p class="sub">Updated @@NOW@@ UTC &middot; tables rebuild every @@RELOAD@@s (paused while a chart is open)<span id="liveq" style="display:none"> &middot; <span style="color:var(--teal);font-weight:600">&#9679; live</span> quotes as of <span id="liveqt"></span></span></p>
   <div class="tabs" style="margin:12px 0 16px">
     <button id="pgus" onclick="showPage('us')">U.S. markets <span class="badge @@STATUSCLASS@@" style="margin-left:6px">@@STATUS@@</span></button>
@@ -982,6 +1006,21 @@ var pgSaved = 'us';
 try { pgSaved = localStorage.getItem('findash_page') || 'us'; } catch (e) {}
 showPage(pgSaved);
 
+function curTheme() { return document.documentElement.classList.contains('dark') ? 'dark' : 'light'; }
+function paintTheme() {
+  var d = curTheme() === 'dark';
+  document.getElementById('themeBtn').innerHTML = d ? '&#9728;' : '&#9790;';
+  var m = document.getElementById('metaTheme');
+  if (m) { m.content = d ? '#17171a' : '#fafaf8'; }
+}
+function toggleTheme() {
+  var t = curTheme() === 'dark' ? 'light' : 'dark';
+  document.documentElement.classList.toggle('dark', t === 'dark');
+  try { localStorage.setItem('findash_theme', t); } catch (e) {}
+  paintTheme();
+}
+paintTheme();
+
 var chartOpen = false;
 function openChart(s, tv, qurl) {
   chartOpen = true;
@@ -990,7 +1029,7 @@ function openChart(s, tv, qurl) {
   document.getElementById('csym').textContent = s;
   document.getElementById('cfinviz').href = qurl;
   document.getElementById('ctv').href = 'https://www.tradingview.com/chart/?symbol=' + encodeURIComponent(tv);
-  var dark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+  var dark = curTheme() === 'dark';
   document.getElementById('cframe').src = 'https://s.tradingview.com/widgetembed/?symbol=' + encodeURIComponent(tv) +
     '&interval=D&theme=' + (dark ? 'dark' : 'light') +
     '&style=1&timezone=exchange&withdateranges=1&hidesidetoolbar=0&symboledit=0&saveimage=0&hideideas=1';
@@ -1085,6 +1124,8 @@ def build_html(stable, surge, win15, win60, trends, us_status, excluded_note, st
         "@@CAL@@": build_calendar_html(calendar),
     }.items():
         html = html.replace(token, value)
+    # every table scrolls horizontally on narrow screens instead of squashing
+    html = html.replace("<table>", '<div class="twrap"><table>').replace("</table>", "</table></div>")
     return html
 
 
