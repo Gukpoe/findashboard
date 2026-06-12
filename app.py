@@ -40,7 +40,16 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
 
-STABLE_TICKERS = "VZ,T,MRK,JNJ,ED,KMB,CL,KO,SO,PEP,PG,DUK,GILD,MO,GIS,ARCC"
+STABLE_INFO = {
+    "VZ": "Verizon Communications", "T": "AT&T", "MRK": "Merck & Co",
+    "JNJ": "Johnson & Johnson", "ED": "Consolidated Edison", "KMB": "Kimberly-Clark",
+    "CL": "Colgate-Palmolive", "KO": "Coca-Cola", "SO": "Southern Company",
+    "PEP": "PepsiCo", "PG": "Procter & Gamble", "DUK": "Duke Energy",
+    "GILD": "Gilead Sciences", "MO": "Altria Group", "GIS": "General Mills",
+    "ARCC": "Ares Capital",
+}
+STABLE_TICKERS = ",".join(STABLE_INFO)
+FORCE_YAHOO = os.environ.get("FORCE_YAHOO", "") == "1"
 STABLE_URL = f"https://finviz.com/screener.ashx?v=171&t={STABLE_TICKERS}&o=ticker"
 SURGE_URLS = [
     "https://finviz.com/screener.ashx?v=141&f=cap_smallover,sh_relvol_o1.5,sh_avgvol_o300&o=-relativevolume&r=1",
@@ -219,6 +228,109 @@ def get_surge_data():
     return out
 
 
+# ---------------- Yahoo fallbacks (Finviz blocks many datacenter IPs) ----------------
+
+def _rsi14(closes):
+    if len(closes) < 15:
+        return None
+    deltas = [closes[i] - closes[i - 1] for i in range(len(closes) - 14, len(closes))]
+    avg_gain = sum(d for d in deltas if d > 0) / 14
+    avg_loss = sum(-d for d in deltas if d < 0) / 14
+    if avg_loss == 0:
+        return 100
+    return round(100 - 100 / (1 + avg_gain / avg_loss))
+
+
+def _beta(rets, mkt_rets):
+    n = min(len(rets), len(mkt_rets))
+    if n < 30:
+        return None
+    r, m = rets[-n:], mkt_rets[-n:]
+    mr, mm = sum(r) / n, sum(m) / n
+    var = sum((x - mm) ** 2 for x in m) / n
+    if var == 0:
+        return None
+    cov = sum((r[i] - mr) * (m[i] - mm) for i in range(n)) / n
+    return round(cov / var, 2)
+
+
+def get_stable_data_yahoo():
+    cache = load_json(DATA_DIR / "yh_stable.json")
+    if cache.get("t") and time.time() - cache["t"] < 600:
+        return cache["rows"]
+    try:
+        mres = yahoo_chart("^GSPC")
+        mcloses = [c for c in mres["indicators"]["quote"][0]["close"] if c]
+        mrets = [mcloses[i] / mcloses[i - 1] - 1 for i in range(1, len(mcloses))]
+    except Exception as e:
+        log(f"  S&P chart failed: {e}")
+        mrets = []
+    rows = []
+    for t, name in STABLE_INFO.items():
+        try:
+            res = yahoo_chart(t)
+            q = res["indicators"]["quote"][0]
+            bars = [(c, h, l, v) for c, h, l, v in
+                    zip(q["close"], q["high"], q["low"], q["volume"]) if c and h and l]
+            if len(bars) < 30:
+                continue
+            closes = [b[0] for b in bars]
+            price = float(res["meta"]["regularMarketPrice"])
+            atr = sum(h - l for _, h, l, _ in bars[-14:]) / 14
+            rets = [closes[i] / closes[i - 1] - 1 for i in range(1, len(closes))]
+            rows.append({
+                "ticker": t, "company": name,
+                "beta": _beta(rets, mrets),
+                "atr_pct": round(100 * atr / price, 1),
+                "rsi": _rsi14(closes), "price": price,
+                "change": round((price / closes[-2] - 1) * 100, 2),
+                "volume": bars[-1][3],
+            })
+            time.sleep(0.25)
+        except Exception as e:
+            log(f"  stable fallback failed for {t}: {e}")
+    rows.sort(key=lambda s: s["beta"] if s["beta"] is not None else 99)
+    save_json(DATA_DIR / "yh_stable.json", {"t": time.time(), "rows": rows})
+    return rows
+
+
+def get_surge_data_yahoo():
+    out, seen = [], set()
+    for scr in ("most_actives", "day_gainers", "day_losers"):
+        try:
+            r = requests.get(
+                "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved"
+                f"?scrIds={scr}&count=100&region=US",
+                headers={"User-Agent": UA}, timeout=20)
+            r.raise_for_status()
+            for q in r.json()["finance"]["result"][0]["quotes"]:
+                sym = q.get("symbol", "")
+                if not sym or sym in seen or q.get("quoteType") != "EQUITY":
+                    continue
+                avg = q.get("averageDailyVolume3Month") or 0
+                vol = q.get("regularMarketVolume") or 0
+                cap = q.get("marketCap")
+                if avg < 300_000 or not vol or (cap is not None and cap < 300e6):
+                    continue
+                rel = round(vol / avg, 1)
+                if rel < 1.2:
+                    continue
+                seen.add(sym)
+                out.append({
+                    "ticker": sym,
+                    "company": q.get("shortName") or q.get("longName") or "",
+                    "perf_week": None, "perf_month": None,
+                    "avg_vol": avg, "rel_vol": rel,
+                    "price": q.get("regularMarketPrice"),
+                    "change": round(q.get("regularMarketChangePercent") or 0, 2),
+                    "volume": vol,
+                })
+        except Exception as e:
+            log(f"  yahoo screener {scr} failed: {e}")
+    out.sort(key=lambda s: -s["rel_vol"])
+    return out[:40]
+
+
 # ---------------- option volume (CBOE) ----------------
 
 def get_option_volumes(tickers):
@@ -318,6 +430,7 @@ def get_vol_trends(surge_data, us_open):
         try:
             res = yahoo_chart(t)
             raw = res["indicators"]["quote"][0]["volume"]
+            closes = [c for c in res["indicators"]["quote"][0]["close"] if c]
             if us_open and len(raw) > 1:
                 raw = raw[:-1]  # drop today's partial bar
             vols = [v for v in raw if v]
@@ -330,7 +443,9 @@ def get_vol_trends(surge_data, us_open):
                 if wk_pre and mo_pre:
                     entry = {"t": time.time(),
                              "week": round(wk / (sum(wk_pre) / len(wk_pre)), 1),
-                             "month": round(mo / (sum(mo_pre) / len(mo_pre)), 1)}
+                             "month": round(mo / (sum(mo_pre) / len(mo_pre)), 1),
+                             "pw": round((closes[-1] / closes[-6] - 1) * 100, 2) if len(closes) >= 6 else None,
+                             "pm": round((closes[-1] / closes[-22] - 1) * 100, 2) if len(closes) >= 22 else None}
                     out[t] = entry
                     cache[t] = entry
                     dirty = True
@@ -341,6 +456,14 @@ def get_vol_trends(surge_data, us_open):
                 out[t] = entry
     if dirty:
         save_json(path, cache)
+    # fill week/month price change when the surge source didn't provide it (Yahoo screener path)
+    for s in surge_data:
+        e = out.get(s["ticker"])
+        if e:
+            if s.get("perf_week") is None:
+                s["perf_week"] = e.get("pw")
+            if s.get("perf_month") is None:
+                s["perf_month"] = e.get("pm")
     return out
 
 
@@ -974,13 +1097,21 @@ def live_quotes_json():
 def refresh_cycle():
     us = us_market_status()
     log(f"Fetching screeners (US market {us['label']}, {us['time']:%H:%M} ET)...")
-    stable = get_stable_data()
-    time.sleep(2)
-    surge = get_surge_data()
-    log(f"Parsed {len(stable)} stable names, {len(surge)} volume-surge names.")
-    if not stable and not surge:
-        log("WARNING: no rows parsed - finviz may be blocking this host. Keeping previous page.")
-        return
+    stable, surge = [], []
+    if not FORCE_YAHOO:
+        stable = get_stable_data()
+        time.sleep(2)
+        surge = get_surge_data()
+        log(f"Finviz: {len(stable)} stable names, {len(surge)} volume-surge names.")
+    fallback = False
+    if not stable:
+        stable = get_stable_data_yahoo()
+        fallback = True
+    if not surge:
+        surge = get_surge_data_yahoo()
+        fallback = True
+    if fallback:
+        log(f"Yahoo fallback: {len(stable)} stable names, {len(surge)} volume-surge names.")
 
     excluded_note = ""
     if stable:
@@ -998,6 +1129,9 @@ def refresh_cycle():
                              + ", ".join(f'{s["ticker"]} ({fmt_vol(s["opt_vol"])})' for s in excluded))
         log(f"Option volume filter: kept {len(kept)}, excluded {len(excluded)}.")
         stable = kept
+    if fallback:
+        src = "U.S. screener data via Yahoo Finance (Finviz unreachable from this host)."
+        excluded_note = f"{src} {excluded_note}" if excluded_note else src
 
     hist_path = DATA_DIR / "history.json"
     history = load_json(hist_path)
