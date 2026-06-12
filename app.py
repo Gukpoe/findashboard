@@ -972,14 +972,18 @@ tbody tr:hover td { background:rgba(125,125,125,.06); }
 
   <h2>Unusual volume surge &mdash; top 20</h2>
   <div class="tabs">
+    <button id="tb5" onclick="show(5)">5 min</button>
     <button id="tb15" onclick="show(15)">15 min</button>
     <button id="tb60" onclick="show(60)">1 hour</button>
+    <button id="tb180" onclick="show(180)">3 hours</button>
     <button id="tb1d" onclick="show(1440)">1 day</button>
     <button id="tb1w" onclick="show(10080)">1 week</button>
     <button id="tb1m" onclick="show(43200)">1 month</button>
   </div>
+  <div id="pane5" style="display:none">@@TAB5@@</div>
   <div id="pane15" style="display:none">@@TAB15@@</div>
   <div id="pane60" style="display:none">@@TAB60@@</div>
+  <div id="pane180" style="display:none">@@TAB180@@</div>
   <div id="pane1w" style="display:none">@@TAB1W@@</div>
   <div id="pane1m" style="display:none">@@TAB1M@@</div>
   <div id="pane1d" style="display:none">
@@ -1023,7 +1027,7 @@ tbody tr:hover td { background:rgba(125,125,125,.06); }
 </div>
 <script>
 function show(n) {
-  var ids = { 15:'15', 60:'60', 1440:'1d', 10080:'1w', 43200:'1m' };
+  var ids = { 5:'5', 15:'15', 60:'60', 180:'180', 1440:'1d', 10080:'1w', 43200:'1m' };
   for (var k in ids) {
     document.getElementById('pane' + ids[k]).style.display = (k == n) ? 'block' : 'none';
     document.getElementById('tb' + ids[k]).className = (k == n) ? 'on' : '';
@@ -1121,8 +1125,8 @@ pollQuotes();
 </html>"""
 
 
-def build_html(stable, surge, win15, win60, trends, us_status, excluded_note, sti, sg_status,
-               news, calendar):
+def build_html(stable, surge, win5, win15, win60, win180, trends, us_status, excluded_note,
+               sti, sg_status, news, calendar):
     reload_s = max(REFRESH_SECONDS, 30) + 5
 
     stable_rows = "".join(
@@ -1157,8 +1161,10 @@ def build_html(stable, surge, win15, win60, trends, us_status, excluded_note, st
         "@@EXCLUDED@@": excluded_html,
         "@@STABLE_ROWS@@": stable_rows,
         "@@SURGE_ROWS@@": "".join(surge_rows),
+        "@@TAB5@@": build_window_table(win5, 5),
         "@@TAB15@@": build_window_table(win15, 15),
         "@@TAB60@@": build_window_table(win60, 60),
+        "@@TAB180@@": build_window_table(win180, 180),
         "@@TAB1W@@": build_trend_table(surge, trends, "week", "week", "perf_week"),
         "@@TAB1M@@": build_trend_table(surge, trends, "month", "month", "perf_month"),
         "@@SGT@@": sg_status["time"].strftime("%H:%M"),
@@ -1271,9 +1277,11 @@ def refresh_cycle():
     if not isinstance(history, list):
         history = []
     current = {s["ticker"]: s["volume"] for s in surge + stable if s.get("volume")}
+    win5 = get_window_surge(history, current, 5, surge)
     win15 = get_window_surge(history, current, 15, surge)
     win60 = get_window_surge(history, current, 60, surge)
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=3)
+    win180 = get_window_surge(history, current, 180, surge)
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=6)
     history = [h for h in history if datetime.fromisoformat(h["t"]) > cutoff]
     history.append({"t": datetime.now(timezone.utc).isoformat(), "v": current})
     save_json(hist_path, history)
@@ -1289,8 +1297,8 @@ def refresh_cycle():
     calendar = get_calendar()
     log(f"News: {len(news)} headlines; calendar: {len(calendar)} events.")
 
-    html = build_html(stable, surge, win15, win60, trends, us, excluded_note, sti, sg,
-                      news, calendar)
+    html = build_html(stable, surge, win5, win15, win60, win180, trends, us, excluded_note,
+                      sti, sg, news, calendar)
     tickers = list(dict.fromkeys(
         [s["ticker"] for s in stable] + [s["ticker"] for s in surge] + [s["sym"] for s in sti]))
     with _lock:
