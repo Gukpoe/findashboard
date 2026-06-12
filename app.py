@@ -593,40 +593,91 @@ def synthetic_events():
     return out
 
 
-def get_calendar():
-    # the FF mirror rate-limits hard (429): one fetch per 6h on success, 15 min backoff on failure
-    ttl = 900 if CAL_CACHE.get("err") else 6 * 3600
-    if CAL_CACHE["t"] and time.time() - CAL_CACHE["t"] < ttl:
-        return CAL_CACHE["events"]
-    events = []
+def _cal_val(v, unit=""):
+    if v in ("", None):
+        return ""
     try:
-        r = requests.get("https://nfs.faireconomy.media/ff_calendar_thisweek.json",
-                         headers={"User-Agent": UA}, timeout=20)
-        r.raise_for_status()
-        events = r.json()
-        CAL_CACHE["err"] = None
-    except Exception as e:
-        CAL_CACHE["err"] = str(e)
-        log(f"  calendar fetch failed: {e}")
-    now = datetime.now(timezone.utc) - timedelta(hours=2)
+        s = f"{float(v):g}"
+    except (TypeError, ValueError):
+        s = str(v)
+    return s + (unit or "")
+
+
+def get_calendar_fxstreet():
+    # full two-week window with consensus values; no key needed, just a Referer
+    start = datetime.now(timezone.utc).strftime("%Y-%m-%dT00:00:00Z")
+    end = (datetime.now(timezone.utc) + timedelta(days=14)).strftime("%Y-%m-%dT23:59:59Z")
+    url = (f"https://calendar-api.fxstreet.com/en/api/v1/eventDates/{start}/{end}"
+           "?volatilities=HIGH&volatilities=MEDIUM"
+           "&countries=US&countries=EMU&countries=CN&countries=JP&countries=GB&culture=en-US")
+    r = requests.get(url, headers={"User-Agent": UA,
+                                   "Referer": "https://www.fxstreet.com/economic-calendar"},
+                     timeout=25)
+    r.raise_for_status()
     out = []
-    for e in events:
+    for e in r.json():
+        cc = e.get("currencyCode") or e.get("countryCode") or ""
+        vol = e.get("volatility", "")
+        is_us = cc in ("USD", "US")
+        # all U.S. high+medium; only high-impact events from the other big economies
+        if not (vol == "HIGH" or (vol == "MEDIUM" and is_us)):
+            continue
+        try:
+            dt = datetime.fromisoformat(e["dateUtc"].replace("Z", "+00:00"))
+        except Exception:
+            continue
+        unit = e.get("unit", "")
+        out.append({"title": e.get("name", ""), "country": cc,
+                    "impact": "High" if vol == "HIGH" else "Medium", "dt": dt,
+                    "forecast": _cal_val(e.get("consensus"), unit),
+                    "previous": _cal_val(e.get("previous"), unit)})
+    return out
+
+
+def get_calendar_forexfactory():
+    # fallback: current calendar week only, and rate-limits datacenter IPs hard
+    r = requests.get("https://nfs.faireconomy.media/ff_calendar_thisweek.json",
+                     headers={"User-Agent": UA}, timeout=20)
+    r.raise_for_status()
+    out = []
+    for e in r.json():
         impact = e.get("impact", "")
         country = e.get("country", "")
-        # High impact from any economy moves U.S. markets; Medium only for USD/global events
         if not (impact == "High" or (impact == "Medium" and country in ("USD", "All"))):
             continue
         try:
             dt = datetime.fromisoformat(e["date"])
         except Exception:
             continue
-        if dt < now:
-            continue
         out.append({"title": e.get("title", ""), "country": country, "impact": impact,
                     "dt": dt, "forecast": e.get("forecast", ""), "previous": e.get("previous", "")})
-    # merge projected majors the weekly feed can't see yet, skipping ones it already lists
+    return out
+
+
+def get_calendar():
+    ttl = 900 if CAL_CACHE.get("err") else 6 * 3600
+    if CAL_CACHE["t"] and time.time() - CAL_CACHE["t"] < ttl:
+        return CAL_CACHE["events"]
+    out = []
+    err = None
+    for name, fn in (("fxstreet", get_calendar_fxstreet), ("forexfactory", get_calendar_forexfactory)):
+        try:
+            out = fn()
+            if out:
+                err = None
+                break
+        except Exception as e:
+            err = f"{name}: {e}"
+            log(f"  calendar source {name} failed: {e}")
+    CAL_CACHE["err"] = err
+    now = datetime.now(timezone.utc) - timedelta(hours=2)
+    out = [e for e in out if e["dt"] >= now]
+    # merge projected majors (FOMC schedule, first-Friday jobs report) the feeds may miss
     for syn in synthetic_events():
-        markers = ("fomc", "federal funds") if "FOMC" in syn["title"] else ("non-farm", "nonfarm")
+        if "FOMC" in syn["title"]:
+            markers = ("fomc", "federal funds", "interest rate decision", "fed press")
+        else:
+            markers = ("non-farm", "nonfarm", "payroll")
         covered = any(any(m in e["title"].lower() for m in markers)
                       and abs((e["dt"] - syn["dt"]).total_seconds()) < 36 * 3600
                       for e in out)
@@ -634,7 +685,7 @@ def get_calendar():
             out.append(syn)
     out.sort(key=lambda x: x["dt"])
     CAL_CACHE["t"] = time.time()
-    CAL_CACHE["events"] = out[:30]
+    CAL_CACHE["events"] = out[:35]
     return CAL_CACHE["events"]
 
 
@@ -959,7 +1010,7 @@ tbody tr:hover td { background:rgba(125,125,125,.06); }
   @@NEWS@@
 
   <h2>Market calendar &mdash; next two weeks</h2>
-  <p class="sub">High-impact releases for all major economies plus medium-impact U.S. events. Detailed forecasts cover the current calendar week (ForexFactory, rolls over each weekend); FOMC decisions and jobs reports are projected for the days beyond. Times shown in both New York and Singapore.</p>
+  <p class="sub">Full 14-day window: all medium and high-impact U.S. releases plus high-impact events from the eurozone, China, Japan and the UK (FXStreet calendar), with consensus forecasts. Times shown in both New York and Singapore.</p>
   @@CAL@@
 
   <p class="foot">Data scraped from finviz.com screeners; option volume from CBOE delayed quotes; SGX and historical data from Yahoo Finance; charts by TradingView. 15-min and 1-hour surges are computed from successive volume snapshots while the server runs. Not investment advice &mdash; verify implied volatility and earnings dates before selling premium.</p>
