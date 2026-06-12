@@ -20,8 +20,10 @@ import re
 import threading
 import time
 from datetime import datetime, timedelta, timezone
-from html import unescape
+from email.utils import parsedate_to_datetime
+from html import escape, unescape
 from pathlib import Path
+from xml.etree import ElementTree
 from zoneinfo import ZoneInfo
 
 import requests
@@ -62,6 +64,34 @@ STI_LIST = [
     ("V03.SI", "Venture Corporation"), ("BS6.SI", "Yangzijiang Shipbuilding"),
     ("AJBU.SI", "Keppel DC REIT"),
 ]
+
+NEWS_FEEDS = [
+    ("CNBC", "https://www.cnbc.com/id/100003114/device/rss/rss.html"),
+    ("MarketWatch", "https://feeds.content.dowjones.io/public/rss/mw_topstories"),
+    ("Yahoo Finance", "https://finance.yahoo.com/news/rssindex"),
+]
+
+# keyword -> tag shown on the headline; used to rank macro-relevant news first
+MACRO_KEYWORDS = {
+    "fed": "Fed", "fomc": "Fed", "powell": "Fed", "interest rate": "Rates",
+    "rate cut": "Rates", "rate hike": "Rates", "treasury": "Rates", "yield": "Rates",
+    "inflation": "Inflation", "cpi": "Inflation", "ppi": "Inflation", "pce": "Inflation",
+    "payroll": "Jobs", "jobs report": "Jobs", "unemployment": "Jobs",
+    "trump": "Trump", "white house": "Washington", "congress": "Washington",
+    "shutdown": "Washington", "debt ceiling": "Washington", "election": "Politics",
+    "tariff": "Trade", "trade war": "Trade", "china": "China",
+    "iran": "Middle East", "israel": "Middle East", "middle east": "Middle East",
+    "hormuz": "Middle East", "gaza": "Middle East",
+    "oil": "Oil", "opec": "Oil", "crude": "Oil",
+    "war": "Geopolitics", "sanction": "Geopolitics", "nato": "Geopolitics",
+    "ukraine": "Geopolitics", "russia": "Geopolitics", "geopolit": "Geopolitics",
+    "gdp": "Economy", "recession": "Economy", "stimulus": "Economy",
+    "dollar": "FX", "ecb": "Central banks", "boj": "Central banks",
+    "spacex": "SpaceX", "musk": "Musk", "gold": "Gold", "bitcoin": "Crypto",
+}
+
+NEWS_CACHE = {"t": 0.0, "items": []}
+CAL_CACHE = {"t": 0.0, "events": []}
 
 STATE = {"html": None, "tickers": [], "built_at": None}
 QUOTE_CACHE = {"t": 0.0, "json": "{}"}
@@ -367,6 +397,83 @@ def get_sti_data(sg_open):
     return out
 
 
+# ---------------- breaking news ----------------
+
+def get_news():
+    if time.time() - NEWS_CACHE["t"] < 300:
+        return NEWS_CACHE["items"]
+    items, seen = [], set()
+    for source, url in NEWS_FEEDS:
+        try:
+            r = requests.get(url, headers={"User-Agent": UA}, timeout=20)
+            r.raise_for_status()
+            root = ElementTree.fromstring(r.content)
+            for item in root.iter("item"):
+                title = (item.findtext("title") or "").strip()
+                link = (item.findtext("link") or "").strip()
+                if not title or not link:
+                    continue
+                key = re.sub(r"\W+", "", title.lower())[:60]
+                if key in seen:
+                    continue
+                seen.add(key)
+                try:
+                    dt = parsedate_to_datetime(item.findtext("pubDate"))
+                except Exception:
+                    # unknown publish time: rank below headlines with real timestamps
+                    dt = datetime.now(timezone.utc) - timedelta(hours=6)
+                low = title.lower()
+                tags = list(dict.fromkeys(
+                    tag for kw, tag in MACRO_KEYWORDS.items()
+                    if re.search(r"\b" + re.escape(kw) + r"\b", low)))[:3]
+                items.append({"title": title, "link": link, "dt": dt,
+                              "source": source, "tags": tags})
+        except Exception as e:
+            log(f"  news feed {source} failed: {e}")
+    # macro-tagged headlines first, then the rest; newest first within each group
+    items.sort(key=lambda x: (0 if x["tags"] else 1,
+                              -x["dt"].timestamp() if x["dt"] else 0))
+    NEWS_CACHE["t"] = time.time()
+    NEWS_CACHE["items"] = items[:14]
+    return NEWS_CACHE["items"]
+
+
+# ---------------- economic calendar ----------------
+
+def get_calendar():
+    if time.time() - CAL_CACHE["t"] < 6 * 3600 and CAL_CACHE["events"]:
+        return CAL_CACHE["events"]
+    events = []
+    for url in ("https://nfs.faireconomy.media/ff_calendar_thisweek.json",
+                "https://nfs.faireconomy.media/ff_calendar_nextweek.json"):
+        try:
+            r = requests.get(url, headers={"User-Agent": UA}, timeout=20)
+            r.raise_for_status()
+            events += r.json()
+        except Exception as e:
+            log(f"  calendar fetch failed: {e}")
+    now = datetime.now(timezone.utc) - timedelta(hours=2)
+    out = []
+    for e in events:
+        impact = e.get("impact", "")
+        country = e.get("country", "")
+        # High impact from any economy moves U.S. markets; Medium only for USD/global events
+        if not (impact == "High" or (impact == "Medium" and country in ("USD", "All"))):
+            continue
+        try:
+            dt = datetime.fromisoformat(e["date"])
+        except Exception:
+            continue
+        if dt < now:
+            continue
+        out.append({"title": e.get("title", ""), "country": country, "impact": impact,
+                    "dt": dt, "forecast": e.get("forecast", ""), "previous": e.get("previous", "")})
+    out.sort(key=lambda x: x["dt"])
+    CAL_CACHE["t"] = time.time()
+    CAL_CACHE["events"] = out[:30]
+    return CAL_CACHE["events"]
+
+
 # ---------------- market clocks ----------------
 
 def us_market_status():
@@ -496,6 +603,57 @@ def build_sti_table(sti, key, chg_key, chg_label, note):
     return "".join(parts)
 
 
+def fmt_ago(dt):
+    mins = max(0, int((datetime.now(timezone.utc) - dt).total_seconds() // 60))
+    if mins < 60:
+        return f"{mins}m ago"
+    if mins < 48 * 60:
+        return f"{mins // 60}h ago"
+    return f"{mins // 1440}d ago"
+
+
+def build_news_html(items):
+    if not items:
+        return '<div class="empty">No headlines fetched - check server logs.</div>'
+    parts = []
+    for it in items:
+        tags = "".join(f'<span class="tag">{t}</span>' for t in it["tags"])
+        parts.append(
+            f'<div class="news-item"><span class="mut" style="min-width:62px">{fmt_ago(it["dt"])}</span>'
+            f'<span class="src">{it["source"]}</span>'
+            f'<a href="{escape(it["link"], quote=True)}" target="_blank" rel="noopener">'
+            f'{escape(it["title"])}</a>{tags}</div>')
+    return "".join(parts)
+
+
+def build_calendar_html(events):
+    if not events:
+        return '<div class="empty">No calendar events fetched - check server logs.</div>'
+    ny, sg = ZoneInfo("America/New_York"), ZoneInfo("Asia/Singapore")
+    parts = ['<table><thead><tr><th style="width:14%">Date</th><th style="width:10%">ET</th>'
+             '<th style="width:10%">SGT</th><th style="width:34%">Event</th>'
+             '<th style="width:8%">Cur</th><th style="width:10%">Impact</th>'
+             '<th class="num" style="width:7%">Forecast</th>'
+             '<th class="num" style="width:7%">Previous</th></tr></thead><tbody>']
+    last_day = None
+    for e in events:
+        et = e["dt"].astimezone(ny)
+        sgt = e["dt"].astimezone(sg)
+        day = et.strftime("%a %d %b")
+        day_cell = day if day != last_day else ""
+        last_day = day
+        imp_cls = "imp-high" if e["impact"] == "High" else "imp-med"
+        parts.append(
+            f'<tr><td>{day_cell}</td><td class="mut">{et:%H:%M}</td>'
+            f'<td class="mut">{sgt:%H:%M}</td><td>{escape(e["title"])}</td>'
+            f'<td class="mut">{e["country"]}</td>'
+            f'<td><span class="badge {imp_cls}">{e["impact"]}</span></td>'
+            f'<td class="num">{e["forecast"] or "-"}</td>'
+            f'<td class="num">{e["previous"] or "-"}</td></tr>')
+    parts.append("</tbody></table>")
+    return "".join(parts)
+
+
 TEMPLATE = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -535,6 +693,15 @@ tr:last-child td { border-bottom:none; }
 .empty { background:var(--card); border:1px dashed var(--bd); border-radius:10px; padding:18px; color:var(--mut); font-size:13px; }
 .note { font-size:12px; color:var(--mut); margin:0 0 8px; }
 .foot { margin-top:24px; font-size:11px; color:var(--mut); }
+.news-item { display:flex; align-items:baseline; gap:10px; padding:7px 10px; background:var(--card); border:1px solid var(--bd); border-top:none; font-size:13px; flex-wrap:wrap; }
+.news-item:first-child { border-top:1px solid var(--bd); border-radius:10px 10px 0 0; }
+.news-item:last-child { border-radius:0 0 10px 10px; }
+.news-item a { color:var(--txt); text-decoration:none; flex:1; min-width:200px; }
+.news-item a:hover { color:#185fa5; }
+.src { font-size:11px; color:var(--mut); border:1px solid var(--bd); border-radius:99px; padding:1px 8px; white-space:nowrap; }
+.tag { font-size:11px; font-weight:600; background:#faeeda; color:#854f0b; border-radius:99px; padding:1px 8px; white-space:nowrap; }
+.badge.imp-high { background:#fceaea; color:#791f1f; }
+.badge.imp-med { background:#faeeda; color:#854f0b; }
 #chartModal { display:none; position:fixed; inset:0; background:rgba(0,0,0,.55); z-index:50; align-items:center; justify-content:center; }
 .cbox { background:var(--card); border:1px solid var(--bd); border-radius:12px; width:min(980px,94vw); height:min(640px,90vh); display:flex; flex-direction:column; overflow:hidden; }
 .chead { display:flex; align-items:center; gap:14px; padding:10px 14px; border-bottom:1px solid var(--bd); }
@@ -598,6 +765,14 @@ tr:last-child td { border-bottom:none; }
   <div id="sgpane1w" style="display:none">@@SG1W@@</div>
   <div id="sgpane1m" style="display:none">@@SG1M@@</div>
   </div>
+
+  <h2>Latest breaking news</h2>
+  <p class="sub">Macro-moving headlines first (tagged by theme), then the latest general market news. Sources: CNBC, MarketWatch, Yahoo Finance; refreshed every 5 min.</p>
+  @@NEWS@@
+
+  <h2>Market calendar &mdash; next two weeks</h2>
+  <p class="sub">High-impact releases for all major economies plus medium-impact U.S. events (ForexFactory feed). Times shown in both New York and Singapore.</p>
+  @@CAL@@
 
   <p class="foot">Data scraped from finviz.com screeners; option volume from CBOE delayed quotes; SGX and historical data from Yahoo Finance; charts by TradingView. 15-min and 1-hour surges are computed from successive volume snapshots while the server runs. Not investment advice &mdash; verify implied volatility and earnings dates before selling premium.</p>
 </div>
@@ -692,7 +867,8 @@ pollQuotes();
 </html>"""
 
 
-def build_html(stable, surge, win15, win60, trends, us_status, excluded_note, sti, sg_status):
+def build_html(stable, surge, win15, win60, trends, us_status, excluded_note, sti, sg_status,
+               news, calendar):
     reload_s = max(REFRESH_SECONDS, 30) + 5
 
     stable_rows = "".join(
@@ -741,6 +917,8 @@ def build_html(stable, surge, win15, win60, trends, us_status, excluded_note, st
                                     "Surge = average daily volume over the last 5 sessions vs the prior 3-month pace."),
         "@@SG1M@@": build_sti_table(sti, "month", "perfM", "Month chg",
                                     "Surge = average daily volume over the last 21 sessions vs the prior 3-month pace."),
+        "@@NEWS@@": build_news_html(news),
+        "@@CAL@@": build_calendar_html(calendar),
     }.items():
         html = html.replace(token, value)
     return html
@@ -840,7 +1018,12 @@ def refresh_cycle():
     sti = get_sti_data(sg["open"])
     log(f"SGX data for {len(sti)} of {len(STI_LIST)} STI constituents (market {sg['label']}).")
 
-    html = build_html(stable, surge, win15, win60, trends, us, excluded_note, sti, sg)
+    news = get_news()
+    calendar = get_calendar()
+    log(f"News: {len(news)} headlines; calendar: {len(calendar)} events.")
+
+    html = build_html(stable, surge, win15, win60, trends, us, excluded_note, sti, sg,
+                      news, calendar)
     tickers = list(dict.fromkeys(
         [s["ticker"] for s in stable] + [s["ticker"] for s in surge] + [s["sym"] for s in sti]))
     with _lock:
