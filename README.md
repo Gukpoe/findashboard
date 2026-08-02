@@ -4,7 +4,8 @@ Live U.S. + Singapore stocks dashboard (Python / Flask).
 
 - **Steady premium generators** — low-beta U.S. defensives with liquid options
   (thin option chains excluded via CBOE option volume).
-- **Unusual volume surge (U.S.)** — 15 min / 1 hour / 1 day / 1 week / 1 month.
+- **Unusual volume surge (U.S.)** — 5 min / 15 min / 1 hour / 3 hours / 1 day / 1 week / 1 month
+  (short windows use real Yahoo intraday 5-minute bars).
 - **Unusual volume surge (Singapore STI)** — 1 day / 1 week / 1 month.
 - Live prices every 15 s (Yahoo), click-to-chart (TradingView embed), dark mode.
 
@@ -21,6 +22,20 @@ python app.py            # http://localhost:8588
 Settings via environment variables: `PORT` (default 8588), `REFRESH_SECONDS`
 (default 60), `MIN_OPT_VOLUME` (default 5000), `FINDASH_DATA` (state directory,
 default `~/.findash-data`).
+
+## Run locally with a public URL (hotspot / home network)
+
+Double-click `Run Web Dashboard.cmd` — it starts the server and a Cloudflare
+tunnel, then prints a `https://….trycloudflare.com` URL usable from any device.
+(If your machine blocks `.cmd` too, run these two lines yourself instead — no
+launcher file needed:)
+
+```
+"%LOCALAPPDATA%\findash-venv\Scripts\python.exe" app.py
+"%LOCALAPPDATA%\FinDashboard\cloudflared.exe" tunnel --url http://localhost:8599
+```
+
+Tunnels are blocked on the corporate network — use a hotspot or home Wi-Fi.
 
 ## Host on Render (free, permanent URL)
 
