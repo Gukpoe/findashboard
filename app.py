@@ -370,37 +370,70 @@ def get_option_volumes(tickers):
 
 # ---------------- intraday volume snapshots (15m / 1h) ----------------
 
-def get_window_surge(history, current, window_min, surge_data):
-    now = datetime.now(timezone.utc)
-    best, best_score = None, None
-    for snap in history:
-        age = (now - datetime.fromisoformat(snap["t"])).total_seconds() / 60
-        if age < window_min * 0.5 or age > window_min * 1.9:
+INTRADAY_WINDOWS = [5, 15, 60, 180]
+
+
+def get_intraday_windows(surge_data):
+    """Real short-window volume surges from Yahoo 5-minute intraday bars.
+
+    For each window w (minutes), surge = shares actually traded in the last w
+    minutes divided by that stock's normal pace for a w-minute stretch
+    (3-month average daily volume spread over the 390-minute session). Unlike
+    the old snapshot method this is accurate immediately - no waiting for the
+    server to accumulate history - and works right after a restart. Bars are
+    cached ~3 min per ticker (they only update every 5 min anyway).
+    """
+    cache = load_json(DATA_DIR / "intraday.json")
+    if not isinstance(cache, dict):
+        cache = {}
+    now = time.time()
+    now_ts = datetime.now(timezone.utc).timestamp()
+    accum = {w: [] for w in INTRADAY_WINDOWS}
+    dirty, fetched = False, 0
+    for s in surge_data:
+        t, avg = s["ticker"], s.get("avg_vol")
+        if not avg:
             continue
-        score = abs(age - window_min)
-        if best_score is None or score < best_score:
-            best, best_score = snap, score
-    if best is None:
-        return None
-    actual_min = (now - datetime.fromisoformat(best["t"])).total_seconds() / 60
-    by_ticker = {s["ticker"]: s for s in surge_data}
-    results = []
-    for ticker, vol in current.items():
-        old = best["v"].get(ticker)
-        info = by_ticker.get(ticker)
-        if old is None or info is None or not info.get("avg_vol"):
+        ent = cache.get(t)
+        bars = ent["bars"] if (ent and now - ent["t"] < 180) else None
+        if bars is None:
+            try:
+                r = requests.get(
+                    f"https://query1.finance.yahoo.com/v8/finance/chart/{t}"
+                    "?range=1d&interval=5m", headers={"User-Agent": UA}, timeout=20)
+                r.raise_for_status()
+                res = r.json()["chart"]["result"][0]
+                ts = res.get("timestamp") or []
+                vol = res["indicators"]["quote"][0]["volume"]
+                bars = [[ts[i], vol[i]] for i in range(len(ts)) if i < len(vol) and vol[i]]
+                cache[t] = {"t": now, "bars": bars}
+                dirty = True
+                fetched += 1
+                time.sleep(0.15)
+            except Exception as e:
+                log(f"  intraday fetch failed for {t}: {e}")
+                bars = ent["bars"] if ent else None
+        if not bars:
             continue
-        delta = vol - old
-        if delta <= 0:  # negative = volume counter reset (new session)
-            continue
-        expected = info["avg_vol"] / 390.0 * actual_min
-        if expected <= 0:
-            continue
-        results.append({"ticker": ticker, "company": info["company"],
-                        "ratio": round(delta / expected, 1), "delta": delta,
-                        "price": info["price"], "change": info["change"]})
-    results.sort(key=lambda r: -r["ratio"])
-    return {"window_min": round(actual_min), "rows": results[:20]}
+        per_min = avg / 390.0
+        for w in INTRADAY_WINDOWS:
+            cutoff = now_ts - w * 60
+            recent = sum(v for bts, v in bars if bts >= cutoff)
+            expected = per_min * w
+            if recent <= 0 or expected <= 0:
+                continue
+            accum[w].append({"ticker": t, "company": s["company"],
+                             "ratio": round(recent / expected, 1), "delta": recent,
+                             "price": s["price"], "change": s["change"]})
+    if dirty:
+        save_json(DATA_DIR / "intraday.json", cache)
+    if fetched:
+        log(f"Intraday 5m bars fetched for {fetched} tickers.")
+    out = {}
+    for w in INTRADAY_WINDOWS:
+        rows = sorted(accum[w], key=lambda r: -r["ratio"])[:20]
+        out[w] = {"window_min": w, "rows": rows}
+    return out
 
 
 # ---------------- weekly / monthly volume trends (Yahoo) ----------------
@@ -749,11 +782,9 @@ def sti_ticker_link(s):
 
 
 def build_window_table(result, nominal_min):
-    if result is None:
-        return (f'<div class="empty">Collecting snapshots - this view needs the server to have '
-                f'been running for ~{nominal_min} minutes.</div>')
-    if not result["rows"]:
-        return '<div class="empty">No volume traded in this window (market likely closed).</div>'
+    if result is None or not result["rows"]:
+        return (f'<div class="empty">No volume in the last {nominal_min} minutes '
+                f'&mdash; the U.S. market is likely closed. Live during market hours.</div>')
     w = result["window_min"]
     parts = [f'<p class="note">Surge = shares traded in the last ~{w} min vs that stock\'s '
              f'normal pace for a {w}-min stretch (3-month average).</p>',
@@ -1272,19 +1303,8 @@ def refresh_cycle():
         src = "U.S. screener data via Yahoo Finance (Finviz unreachable from this host)."
         excluded_note = f"{src} {excluded_note}" if excluded_note else src
 
-    hist_path = DATA_DIR / "history.json"
-    history = load_json(hist_path)
-    if not isinstance(history, list):
-        history = []
-    current = {s["ticker"]: s["volume"] for s in surge + stable if s.get("volume")}
-    win5 = get_window_surge(history, current, 5, surge)
-    win15 = get_window_surge(history, current, 15, surge)
-    win60 = get_window_surge(history, current, 60, surge)
-    win180 = get_window_surge(history, current, 180, surge)
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=6)
-    history = [h for h in history if datetime.fromisoformat(h["t"]) > cutoff]
-    history.append({"t": datetime.now(timezone.utc).isoformat(), "v": current})
-    save_json(hist_path, history)
+    iw = get_intraday_windows(surge)
+    win5, win15, win60, win180 = iw[5], iw[15], iw[60], iw[180]
 
     trends = get_vol_trends(surge, us["open"])
     log(f"Volume trends available for {len(trends)} of {len(surge)} tickers.")
@@ -1360,7 +1380,8 @@ def _start_background():
     t.start()
 
 
-_start_background()
+if os.environ.get("FINDASH_NO_LOOP") != "1":
+    _start_background()
 
 if __name__ == "__main__":
     log(f"FinDashboard web starting on http://localhost:{PORT}/")
